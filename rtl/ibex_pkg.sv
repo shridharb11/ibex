@@ -6,6 +6,9 @@
 /**
  * Package with constants used by Ibex
  */
+
+//`define DIFT 1
+
 package ibex_pkg;
 
   ////////////////
@@ -190,6 +193,16 @@ package ibex_pkg;
     ALU_CRC32_W,
     ALU_CRC32C_W
   } alu_op_e;
+   
+  // Tag Propagation Modes
+  typedef enum logic [1:0] {
+    ALU_MODE_OLD   = 2'b00, // Keep existing tag (or no change)
+    ALU_MODE_AND   = 2'b01, // New Tag = Tag A AND Tag B
+    ALU_MODE_OR    = 2'b10, // New Tag = Tag A OR Tag B
+    ALU_MODE_CLEAR = 2'b11  // New Tag = 0
+  } tag_mode_e;
+
+  parameter int ALU_MODE_WIDTH = 2;  // Width for the mode signals
 
   typedef enum logic [1:0] {
     // Multiplier/divider
@@ -199,6 +212,67 @@ package ibex_pkg;
     MD_OP_REM
   } md_op_e;
 
+  //////////////////////////////
+  // DIFT Policy Bit-Mapping //
+  /////////////////////////////
+
+  // TCR (Tag Control Register) Bit Offsets
+  // These indices define which policy bits control specific hardware sinks.
+  parameter int EXECUTE_PC          = 0;  // Check if PC itself is tainted
+  // Jump Checks
+  parameter int JUMP_CHECK_S1       = 1;  // Check Source 1 for Jumps
+  parameter int JUMP_CHECK_S2       = 2;  // Check Source 2 for Jumps
+  parameter int JUMP_CHECK_D        = 3;  // Check Destination for Jumps
+  // Branch Checks
+  parameter int BRANCH_CHECK_S1     = 4;
+  parameter int BRANCH_CHECK_S2     = 5;
+  // Load/Store Checks
+  parameter int LOADSTORE_CHECK_DA  = 6;  // Check Data Address pointer
+  parameter int LOADSTORE_CHECK_S   = 7;  // Check Source data (for Store)
+  parameter int LOADSTORE_CHECK_D   = 8;  // Check Destination (for Load)
+  // Arithmetic Checks
+  parameter int INTEGER_CHECK_S1    = 9;
+  parameter int INTEGER_CHECK_S2    = 10;
+  parameter int INTEGER_CHECK_D     = 11;
+  // Shift/Logical/Comparison
+  parameter int SHIFT_CHECK_S1      = 12;
+  parameter int SHIFT_CHECK_D       = 13;
+  parameter int LOGICAL_CHECK_S1    = 14;
+  parameter int LOGICAL_CHECK_D     = 15;
+  parameter int COMPARISON_CHECK_S1 = 16;
+  parameter int COMPARISON_CHECK_D  = 17;
+
+  // Optional: Define the width of the TCR register based on the highest bit
+  parameter int TCR_WIDTH = 22;
+
+  // TPR Bit Mapping for Propagation Policies (2-bit fields)
+  parameter int JUMP_LOW           = 0;
+  parameter int JUMP_HIGH          = 1;
+  parameter int BRANCH_LOW         = 2;
+  parameter int BRANCH_HIGH        = 3;
+  parameter int LOADSTORE_LOW      = 4;
+  parameter int LOADSTORE_HIGH     = 5;
+  parameter int INTEGER_LOW        = 6;
+  parameter int INTEGER_HIGH       = 7;
+  parameter int SHIFT_LOW          = 8;
+  parameter int SHIFT_HIGH         = 9;
+  parameter int LOGICAL_LOW        = 10;
+  parameter int LOGICAL_HIGH       = 11;
+  parameter int COMPARISON_LOW     = 12;
+  parameter int COMPARISON_HIGH    = 13;
+
+  // TPR Enable Bits (Control if a source contributes to the result tag)
+  parameter int LOADSTORE_EN_SOURCE_ADDR = 14; // Enable address tag propagation
+  parameter int LOADSTORE_EN_SOURCE      = 15; // Enable memory data tag propagation
+  parameter int LOADSTORE_EN_DEST_ADDR   = 16; // Enable dest address tag (for Stores)
+
+  // TMU constants
+  parameter int SHIFT_CHECK_S2       = 18; //SHIFT_CHECK_D;       // alias — same bit
+  parameter int LOGICAL_CHECK_S2     = 19; //LOGICAL_CHECK_D;     // alias — same bit
+  parameter int COMPARISON_CHECK_S2  = 20; //COMPARISON_CHECK_D;  // alias — same bit
+  parameter int LOADSTORE_CHECK_SA   = 21; //LOADSTORE_CHECK_DA;  // alias — same bit
+  localparam logic [6:0] OPCODE_OPIMM      = 7'h13;         // alias for OPCODE_OP_IMM
+  //localparam logic [6:0] OPCODE_STORE_POST = 7'h2b;         // PULP post-inc store (unused in standard Ibex)
 
   //////////////////////////////////
   // Control and status registers //
@@ -394,8 +468,6 @@ package ibex_pkg;
   parameter int unsigned IC_INDEX_HI      = IC_INDEX_W + IC_LINE_W - 1;
   parameter int unsigned IC_TAG_SIZE      = ADDR_W - IC_INDEX_W - IC_LINE_W + 1; // 1 valid bit
   parameter int unsigned IC_OUTPUT_BEATS  = (BUS_BYTES / 2); // number of halfwords
-  parameter int unsigned IC_DATA_ECC_SIZE = 7;
-  parameter int unsigned IC_TAG_ECC_SIZE  = 6;
   // ICache Scrambling Parameters
   parameter int unsigned SCRAMBLE_KEY_W   = 128;
   parameter int unsigned SCRAMBLE_NONCE_W = 64;
@@ -609,7 +681,11 @@ package ibex_pkg;
     CSR_MHPMCOUNTER30H = 12'hB9E,
     CSR_MHPMCOUNTER31H = 12'hB9F,
     CSR_CPUCTRLSTS     = 12'h7C0,
-    CSR_SECURESEED     = 12'h7C1
+    CSR_SECURESEED     = 12'h7C1,
+
+    //DIFT CSRs (TPR and TCR)
+    CSR_TCR         = 12'h7C2,
+    CSR_TPR         = 12'h7C3
   } csr_num_e;
 
   // CSR pmp-related offsets

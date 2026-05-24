@@ -110,6 +110,13 @@ module ibex_controller #(
                                                          // instruction (j, jr, jal, jalr)
   output logic                  perf_tbranch_o           // we are executing a taken branch
                                                          // instruction
+  `ifdef DIFT
+    ,
+    input  logic                  lsu_tag_err_i,          // From LSU (Load Taint Violation)
+    input  logic                  ex_tag_err_i,           // From EX (Arithmetic Taint Violation)
+    output logic                  tag_err_o,              // To Trap Handler/CS-Regs
+    input  logic                  tcr_execute_pc_check_i // Policy: Check if PC can be tainted
+  `endif
 );
   import ibex_pkg::*;
 
@@ -131,6 +138,10 @@ module ibex_controller #(
   logic ebrk_insn_prio;
   logic store_err_prio;
   logic load_err_prio;
+
+  `ifdef DIFT
+    logic tag_err_prio;
+  `endif
 
   logic stall;
   logic halt_if;
@@ -167,7 +178,31 @@ module ibex_controller #(
   logic csr_pipe_flush;
   logic instr_fetch_err;
 
+  logic tag_err;
+
+`ifdef DIFT
+  // Combined DIFT violation signal
+  // aggregating all taint exceptions
+  assign tag_err   = lsu_tag_err_i | ex_tag_err_i;
+  assign tag_err_o = tag_err;
+`else
+  assign tag_err   = 1'b0;
+`endif
+
 `ifndef SYNTHESIS
+  // synopsys translate_off
+  // make sure we are called later so that we do not generate messages for
+  // glitches
+  always_ff @(negedge clk_i) begin
+    // print warning in case of decoding errors
+    if ((ctrl_fsm_cs == DECODE) && instr_valid_i && !instr_fetch_err_i && illegal_insn_d) begin
+      $display("%t: Illegal instruction at PC 0x%h: 0x%h", $time,
+               pc_id_i, instr_is_compressed_i ? {16'b0, instr_compressed_i} : instr_i );
+    end
+  end
+  // synopsys translate_on
+`endif
+/*`ifndef SYNTHESIS
   // synopsys translate_off
   // make sure we are called later so that we do not generate messages for
   // glitches
@@ -179,7 +214,7 @@ module ibex_controller #(
     end
   end
   // synopsys translate_on
-`endif
+`endif */
 
   ////////////////
   // Exceptions //
@@ -211,8 +246,12 @@ module ibex_controller #(
   // the FLUSH state so the cycle following exc_req_q won't remain set for an
   // exception request that has just been handled.
   // All terms in this expression are qualified by instr_valid_i
-  assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err) &
-                     (ctrl_fsm_cs != FLUSH);
+  //assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err) & (ctrl_fsm_cs != FLUSH);
+  `ifdef DIFT
+    assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err | tag_err) & (ctrl_fsm_cs != FLUSH);
+  `else
+    assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err) & (ctrl_fsm_cs != FLUSH);
+  `endif
 
   // LSU exception requests
   assign exc_req_lsu = store_err_i | load_err_i;
@@ -245,10 +284,19 @@ module ibex_controller #(
       ebrk_insn_prio       = 0;
       store_err_prio       = 0;
       load_err_prio        = 0;
+      /*`ifdef DIFT
+          tag_err_prio = 0;
+        if (tag_err & instr_valid_i) begin
+                tag_err_prio = 1'b1;
+        end
+      `endif */
 
       // Note that with the writeback stage store/load errors occur on the instruction in writeback,
       // all other exception/faults occur on the instruction in ID/EX. The faults from writeback
       // must take priority as that instruction is architecturally ordered before the one in ID/EX.
+      `ifdef DIFT
+        tag_err_prio = 0;
+      `endif
       if (store_err_q) begin
         store_err_prio = 1'b1;
       end else if (load_err_q) begin
@@ -261,6 +309,11 @@ module ibex_controller #(
         ecall_insn_prio = 1'b1;
       end else if (ebrk_insn) begin
         ebrk_insn_prio = 1'b1;
+      //end
+      `ifdef DIFT
+      end else if (tag_err & instr_valid_i) begin
+        tag_err_prio = 1'b1;
+      `endif
       end
     end
 
@@ -274,7 +327,15 @@ module ibex_controller #(
       ebrk_insn_prio       = 0;
       store_err_prio       = 0;
       load_err_prio        = 0;
-
+      /*`ifdef DIFT
+          tag_err_prio = 0;
+        if (tag_err & instr_valid_i) begin
+          tag_err_prio = 1'b1;
+        end
+      `endif */
+      `ifdef DIFT
+        tag_err_prio = 0;
+      `endif
       if (instr_fetch_err) begin
         instr_fetch_err_prio = 1'b1;
       end else if (illegal_insn_q) begin
@@ -287,10 +348,17 @@ module ibex_controller #(
         store_err_prio = 1'b1;
       end else if (load_err_q) begin
         load_err_prio  = 1'b1;
-      end
+      //end
+      `ifdef DIFT
+      end else if (tag_err & instr_valid_i) begin
+        tag_err_prio = 1'b1;
+      `endif
+    end
     end
     assign wb_exception_o = 1'b0;
   end
+
+//Checks $onehot exception priority encoding to include tag_err_prio for DIFT
 
   `ASSERT_IF(IbexExceptionPrioOnehot,
              $onehot({instr_fetch_err_prio,
@@ -298,7 +366,9 @@ module ibex_controller #(
                       ecall_insn_prio,
                       ebrk_insn_prio,
                       store_err_prio,
-                      load_err_prio}),
+                      load_err_prio
+                      `ifdef DIFT , tag_err_prio `endif
+                      }),
              (ctrl_fsm_cs == FLUSH) & exc_req_q)
 
   ////////////////
@@ -632,6 +702,19 @@ module ibex_controller #(
           end
         end
 
+       /* `ifdef DIFT
+            if (illegal_insn_i || ecall_insn_i || ebrk_insn_i || tag_err) begin
+            ctrl_fsm_ns = IRQ_TAKEN;
+            flush_id_o  = 1'b1; // Flush tainted instruction from pipeline
+            end
+
+            if (tag_err) begin
+              ctrl_fsm_ns  = FLUSH;       // use FLUSH not IRQ_TAKEN — no PC redirect needed
+              flush_id_o   = 1'b1;
+              exc_cause_o  = ExcCauseIllegalInsn; // closest standard cause
+            end
+        `endif */
+
       end // DECODE
 
       IRQ_TAKEN: begin
@@ -791,6 +874,14 @@ module ibex_controller #(
               exc_cause_o = ExcCauseLoadAccessFault;
               csr_mtval_o = lsu_addr_last_i;
             end
+
+            `ifdef DIFT
+              tag_err_prio: begin
+              exc_cause_o = ExcCauseIllegalInsn;  // or a custom cause
+              csr_mtval_o = pc_id_i;
+              end
+            `endif
+            
             default: ;
           endcase
         end else begin

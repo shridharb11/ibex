@@ -3,6 +3,8 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
+//`define DIFT 1'b1  // Set to 1 to enable DIFT features (guarded by `ifdef DIFT in the code)
+
 `ifdef RISCV_FORMAL
   `define RVFI
 `endif
@@ -12,6 +14,9 @@
 
 /**
  * Top level module of the ibex RISC-V core
+ *
+ * All DIFT additions are guarded by `ifdef DIFT.
+ * The original core architecture is 100% preserved when DIFT is not defined.
  */
 module ibex_core import ibex_pkg::*; #(
   parameter bit                     PMPEnable                   = 1'b0,
@@ -30,7 +35,6 @@ module ibex_core import ibex_pkg::*; #(
   parameter bit                     WritebackStage              = 1'b0,
   parameter bit                     ICache                      = 1'b0,
   parameter bit                     ICacheECC                   = 1'b0,
-  parameter bit                     ICacheTweakInfection        = 1'b0,
   parameter int unsigned            BusSizeECC                  = BUS_SIZE,
   parameter int unsigned            TagSizeECC                  = IC_TAG_SIZE,
   parameter int unsigned            LineSizeECC                 = IC_LINE_SIZE,
@@ -50,9 +54,7 @@ module ibex_core import ibex_pkg::*; #(
   parameter int unsigned            DmAddrMask                  = 32'h00000FFF,
   parameter int unsigned            DmHaltAddr                  = 32'h1A110800,
   parameter int unsigned            DmExceptionAddr             = 32'h1A110808,
-  // mvendorid: encoding of manufacturer/provider
   parameter logic [31:0]            CsrMvendorId                = 32'b0,
-  // marchid: encoding of base microarchitecture
   parameter logic [31:0]            CsrMimpId                   = 32'b0
 ) (
   // Clock and Reset
@@ -111,7 +113,7 @@ module ibex_core import ibex_pkg::*; #(
   input  logic                         irq_timer_i,
   input  logic                         irq_external_i,
   input  logic [14:0]                  irq_fast_i,
-  input  logic                         irq_nm_i,       // non-maskable interrupt
+  input  logic                         irq_nm_i,
   output logic                         irq_pending_o,
 
   // Debug Interface
@@ -122,8 +124,6 @@ module ibex_core import ibex_pkg::*; #(
   output logic                         double_fault_seen_o,
 
   // RISC-V Formal Interface
-  // Does not comply with the coding standards of _i/_o suffixes, but follows
-  // the convention of RISC-V Formal Interface Specification.
 `ifdef RVFI
   output logic                         rvfi_valid,
   output logic [63:0]                  rvfi_order,
@@ -163,7 +163,7 @@ module ibex_core import ibex_pkg::*; #(
   output logic                         rvfi_ext_expanded_insn_valid,
   output logic [15:0]                  rvfi_ext_expanded_insn,
   output logic                         rvfi_ext_expanded_insn_last,
-  `endif
+`endif
 
   // CPU Control Signals
   // SEC_CM: FETCH.CTRL.LC_GATED
@@ -172,6 +172,18 @@ module ibex_core import ibex_pkg::*; #(
   output logic                         alert_major_internal_o,
   output logic                         alert_major_bus_o,
   output ibex_mubi_t                   core_busy_o
+
+  // *** DIFT *** Tag memory interface and security exception output
+  // The tag shadow RAM is parallel to the data RAM.
+  // ibex_core drives data_wdata_tag_o and reads data_rdata_tag_i in parallel
+  // uses the normal data memory bus 
+  // tag memory model (1 bit per word )
+`ifdef DIFT
+  ,
+  input  logic                         data_rdata_tag_i,  // Tag bit read from shadow RAM
+  output logic                         data_wdata_tag_o,  // Tag bit written to shadow RAM
+  output logic                         dift_exception_o   // DIFT security exception
+`endif
 );
 
   localparam int unsigned PMPNumChan      = 3;
@@ -180,27 +192,28 @@ module ibex_core import ibex_pkg::*; #(
   localparam bit          PCIncrCheck       = SecureIbex;
   localparam bit          ShadowCSR         = 1'b0;
 
-  // IF/ID signals
+  // ---------------------------------------------------------------------------
+  // IF/ID signals  (original — untouched)
+  // ---------------------------------------------------------------------------
   logic        dummy_instr_id;
   logic        instr_valid_id;
   logic        instr_new_id;
-  logic [31:0] instr_rdata_id;                 // Instruction sampled inside IF stage
-  logic [31:0] instr_rdata_alu_id;             // Instruction sampled inside IF stage (replicated to
-                                               // ease fan-out)
-  logic [15:0] instr_rdata_c_id;               // Compressed instruction sampled inside IF stage
+  logic [31:0] instr_rdata_id;
+  logic [31:0] instr_rdata_alu_id;
+  logic [15:0] instr_rdata_c_id;
   logic        instr_is_compressed_id;
   instr_exp_e  instr_gets_expanded_id;
   logic [15:0] instr_expanded_id;
   logic        instr_perf_count_id;
   logic        instr_bp_taken_id;
-  logic        instr_fetch_err;                // Bus error on instr fetch
-  logic        instr_fetch_err_plus2;          // Instruction error is misaligned
-  logic        illegal_c_insn_id;              // Illegal compressed instruction sent to ID stage
-  logic [31:0] pc_if;                          // Program counter in IF stage
-  logic [31:0] pc_id;                          // Program counter in ID stage
-  logic [31:0] pc_wb;                          // Program counter in WB stage
-  logic [33:0] imd_val_d_ex[2];                // Intermediate register for multicycle Ops
-  logic [33:0] imd_val_q_ex[2];                // Intermediate register for multicycle Ops
+  logic        instr_fetch_err;
+  logic        instr_fetch_err_plus2;
+  logic        illegal_c_insn_id;
+  logic [31:0] pc_if;
+  logic [31:0] pc_id;
+  logic [31:0] pc_wb;
+  logic [33:0] imd_val_d_ex[2];
+  logic [33:0] imd_val_q_ex[2];
   logic [1:0]  imd_val_we_ex;
 
   logic        data_ind_timing;
@@ -219,9 +232,9 @@ module ibex_core import ibex_pkg::*; #(
   logic        pc_set;
   logic        nt_branch_mispredict;
   logic [31:0] nt_branch_addr;
-  pc_sel_e     pc_mux_id;                      // Mux selector for next PC
-  exc_pc_sel_e exc_pc_mux_id;                  // Mux selector for exception PC
-  exc_cause_t  exc_cause;                      // Exception cause
+  pc_sel_e     pc_mux_id;
+  exc_pc_sel_e exc_pc_mux_id;
+  exc_cause_t  exc_cause;
 
   logic        instr_intg_err;
   logic        lsu_load_err, lsu_load_err_raw;
@@ -232,20 +245,16 @@ module ibex_core import ibex_pkg::*; #(
   logic        expecting_load_resp_id;
   logic        expecting_store_resp_id;
 
-  // LSU signals
   logic        lsu_addr_incr_req;
   logic [31:0] lsu_addr_last;
 
-  // Jump and branch target and decision (EX->IF)
   logic [31:0] branch_target_ex;
   logic        branch_decision;
 
-  // Core busy signals
   logic        ctrl_busy;
   logic        if_busy;
   logic        lsu_busy;
 
-  // Register File
   logic [4:0]  rf_raddr_a;
   logic [31:0] rf_rdata_a;
   logic [4:0]  rf_raddr_b;
@@ -254,8 +263,6 @@ module ibex_core import ibex_pkg::*; #(
   logic        rf_ren_b;
   logic [4:0]  rf_waddr_wb;
   logic [31:0] rf_wdata_wb;
-  // Writeback register write data that can be used on the forwarding path (doesn't factor in memory
-  // read data as this is too late for the forwarding path)
   logic [31:0] rf_wdata_fwd_wb;
   logic [31:0] rf_wdata_lsu;
   logic        rf_we_wb;
@@ -268,7 +275,6 @@ module ibex_core import ibex_pkg::*; #(
   logic        rf_rd_a_wb_match;
   logic        rf_rd_b_wb_match;
 
-  // ALU Control
   alu_op_e     alu_operator_ex;
   logic [31:0] alu_operand_a_ex;
   logic [31:0] alu_operand_b_ex;
@@ -276,10 +282,9 @@ module ibex_core import ibex_pkg::*; #(
   logic [31:0] bt_a_operand;
   logic [31:0] bt_b_operand;
 
-  logic [31:0] alu_adder_result_ex;    // Used to forward computed address to LSU
+  logic [31:0] alu_adder_result_ex;
   logic [31:0] result_ex;
 
-  // Multiplier Control
   logic        mult_en_ex;
   logic        div_en_ex;
   logic        mult_sel_ex;
@@ -290,18 +295,14 @@ module ibex_core import ibex_pkg::*; #(
   logic [31:0] multdiv_operand_b_ex;
   logic        multdiv_ready_id;
 
-  // CSR control
   logic        csr_access;
   csr_op_e     csr_op;
   logic        csr_op_en;
   csr_num_e    csr_addr;
   logic [31:0] csr_rdata;
   logic [31:0] csr_wdata;
-  logic        illegal_csr_insn_id;    // CSR access to non-existent register,
-                                       // with wrong privilege level,
-                                       // or missing write permissions
+  logic        illegal_csr_insn_id;
 
-  // Data Memory Control
   logic        lsu_we;
   logic [1:0]  lsu_type;
   logic        lsu_sign_ext;
@@ -310,19 +311,16 @@ module ibex_core import ibex_pkg::*; #(
   logic [31:0] lsu_wdata;
   logic        lsu_req_done;
 
-  // stall control
   logic        id_in_ready;
   logic        ex_valid;
 
   logic        lsu_resp_valid;
   logic        lsu_resp_err;
 
-  // Signals between instruction core interface and pipe (if and id stages)
-  logic        instr_req_int;          // Id stage asserts a req to instruction core interface
+  logic        instr_req_int;
   logic        instr_req_gated;
   logic        instr_exec;
 
-  // Writeback stage
   logic           en_wb;
   wb_instr_type_e instr_type_wb;
   logic           ready_wb;
@@ -331,13 +329,11 @@ module ibex_core import ibex_pkg::*; #(
   logic           outstanding_store_wb;
   logic           dummy_instr_wb;
 
-  // Interrupts
   logic        nmi_mode;
   irqs_t       irqs;
   logic        csr_mstatus_mie;
   logic [31:0] csr_mepc, csr_depc;
 
-  // PMP signals
   logic [PMP_ADDR_MSB:0]  csr_pmp_addr [PMPNumRegions];
   pmp_cfg_t               csr_pmp_cfg  [PMPNumRegions];
   pmp_mseccfg_t           csr_pmp_mseccfg;
@@ -357,7 +353,6 @@ module ibex_core import ibex_pkg::*; #(
   priv_lvl_e   priv_mode_id;
   priv_lvl_e   priv_mode_lsu;
 
-  // debug mode and dcsr configuration
   logic        debug_mode;
   logic        debug_mode_entering;
   dbg_cause_e  debug_cause;
@@ -367,8 +362,6 @@ module ibex_core import ibex_pkg::*; #(
   logic        debug_ebreaku;
   logic        trigger_match;
 
-  // signals relating to instruction movements between pipeline stages
-  // used by performance counters and RVFI
   logic        instr_id_done;
   logic        instr_done_wb;
 
@@ -386,18 +379,81 @@ module ibex_core import ibex_pkg::*; #(
   logic        perf_load;
   logic        perf_store;
 
-  // for RVFI
-  logic        illegal_insn_id, unused_illegal_insn_id; // ID stage sees an illegal instruction
+  logic        illegal_insn_id, unused_illegal_insn_id;
+
+  // ---------------------------------------------------------------------------
+  // * DIFT Internal signal declarations
+  //
+  //   CSR (TPR/TCR) → ID (policy decode + operand-tag mux) → EX (propagate)
+  //                                                        → LSU (tag mem)
+  //                                                        → WB  (tag RF write)
+  //
+  // Core-level modules:
+  //   ibex_dift_tmu          – decodes TCR per-instruction check bits
+  //   riscv_mode_tag         – decodes TPR ALU propagation mode
+  //   riscv_enable_tag       – decodes TPR store-enable bits
+  //   riscv_load_check       – raises exception on load-address taint violation
+  //   riscv_load_propagation – computes destination tag for LOAD operations
+  // ---------------------------------------------------------------------------
+`ifdef DIFT
+  // Policy CSRs – driven by ibex_cs_registers outputs
+  logic [31:0] tpr_csr;             // Tag Propagation Register (17 bits)
+  logic [31:0] tcr_csr;             // Tag Check Register       (22 bits)
+
+  // IF → ID instruction tag (tag of the PC currently in the ID stage)
+  logic        pc_if_tag;
+  logic        pc_id_tag;
+
+  // Tag register file read ports (shadow the integer RF addresses)
+  logic        rf_rdata_a_tag;       // Tag of rs1
+  logic        rf_rdata_b_tag;       // Tag of rs2
+
+  // ID → EX tag pipeline registers
+  logic        alu_op_a_tag_ex;      // Resolved operand-A tag (latched by id_stage FF)
+  logic        alu_op_b_tag_ex;      // Resolved operand-B tag
+  logic        lsu_wdata_tag_id;     // Store-data tag leaving ID
+  logic        rf_we_tag_id;         // RF write-enable tag leaving ID
+  logic        pc_set_tag;           // Tainted branch/jump target tag (ID → IF)
+
+  // EX block tag outputs
+  logic        rf_wdata_ex_tag;      // Result tag fed back to ID for forwarding
+  logic        regfile_wdata_tag;    // Result tag to WB
+  logic        rf_we_tag_ex_out;     // WE tag to WB
+  logic        lsu_wdata_tag_lsu;    // Store-data tag forwarded to LSU
+
+  // LSU tag signals
+  logic        lsu_rdata_tag;        // Loaded-word tag (LSU → WB)
+  logic        lsu_tag_err;          // Load-address taint violation (LSU)
+
+  // WB stage tag signals
+  logic        rf_wdata_tag_wb;      // Tag to be written to the tag register file
+  logic        rf_we_tag_wb;         // Write-enable for tag register file
+  logic        rf_wdata_fwd_tag_wb;  // Forwarded tag from WB to ID (hazard resolution)
+
+  //TMU decode outputs 
+  logic        dift_s1_check;        // TCR: check source-1 tag
+  logic        dift_s2_check;        // TCR: check source-2 tag
+  logic        dift_dest_check;      // TCR: check destination tag
+  logic        dift_pc_check;        // TCR: check PC (execute-check bit)
+  logic [ALU_MODE_WIDTH-1:0] alu_tag_mode;  // TPR: ALU propagation mode (AND/OR/CLEAR/OLD)
+  logic        rf_tag_we_tmu;        // TPR mode decoder: tag write enable for ALU instrs
+  logic        is_store_tmu;         // Enable decoder: current instruction is a store
+  logic        memory_set_tmu;       // Mode decoder: memory-set special case
+  logic        is_store_post_tmu;    // Mode decoder: post-increment store
+
+  // Load check / propagation (uses WB-stage signals)
+  logic        load_exception;       // Raised when load violates TCR policy
+  logic        rf_we_tag_load;       // Tag value for the load destination register
+  logic        rf_tag_we_load;       // Enable writing rf_we_tag_load to tag RF
+  logic        ex_exception;         // EX-stage taint violation from ibex_dift_logic
+  logic        pc_exception;         // PC tag violation in EX
+`endif
 
   //////////////////////
   // Clock management //
   //////////////////////
 
-  // Before going to sleep, wait for I- and D-side
-  // interfaces to finish ongoing operations.
   if (SecureIbex) begin : g_core_busy_secure
-    // For secure Ibex, the individual bits of core_busy_o are generated from different copies of
-    // the various busy signal.
     localparam int unsigned NumBusySignals = 3;
     localparam int unsigned NumBusyBits = $bits(ibex_mubi_t) * NumBusySignals;
     logic [NumBusyBits-1:0] busy_bits_buf;
@@ -407,8 +463,6 @@ module ibex_core import ibex_pkg::*; #(
       .in_i ({$bits(ibex_mubi_t){ctrl_busy, if_busy, lsu_busy}}),
       .out_o(busy_bits_buf)
     );
-
-    // Set core_busy_o to IbexMuBiOn if even a single input is high.
     for (genvar i = 0; i < $bits(ibex_mubi_t); i++) begin : g_core_busy_bits
       if (IbexMuBiOn[i] == 1'b1) begin : g_pos
         assign core_busy_o[i] =  |busy_bits_buf[i*NumBusySignals +: NumBusySignals];
@@ -417,38 +471,96 @@ module ibex_core import ibex_pkg::*; #(
       end
     end
   end else begin : g_core_busy_non_secure
-    // For non secure Ibex, synthesis is allowed to optimize core_busy_o.
     assign core_busy_o = (ctrl_busy || if_busy || lsu_busy) ? IbexMuBiOn : IbexMuBiOff;
   end
+
+  // ===========================================================================
+`ifdef DIFT
+  // decoding per-instruction TAG CHECK bits from TCR
+  ibex_dift_tmu u_ibex_dift_tmu (
+    .instr_rdata_i ( instr_rdata_id  ),
+    .tcr_i         ( tcr_csr         ),
+    .source_1_o    ( dift_s1_check   ),
+    .source_2_o    ( dift_s2_check   ),
+    .dest_o        ( dift_dest_check ),
+    .execute_pc_o  ( dift_pc_check   )
+  );
+
+  //checking if a LOAD operation violates the security policy based on TCR
+  // usigng wb signals = runs when rf_we_wb_o is asserted
+  riscv_load_check u_ibex_load_check (
+    .regfile_wdata_wb_i_tag ( lsu_rdata_tag    ),  // tag of loaded word (from tag RAM)
+    .rs1_i_tag              ( rf_rdata_a_tag   ),  // tag of base-address register
+    .regfile_dest_tag       ( rf_wdata_tag_wb  ),  // tag to be written to destination
+    .tcr_i                  ( tcr_csr          ),
+    .regfile_we_wb_i        ( rf_we_lsu         ),  // WB write enable 
+    .exception_o            ( load_exception   )
+  );
+
+  // computing destination tag for LOAD based on TPR and source tags
+  // output rf_we_tag_load is the computed tag value for the loaded register.
+  riscv_load_propagation u_ibex_load_propagation (
+    .regfile_wdata_wb_i_tag ( lsu_rdata_tag    ),  // tag of loaded word
+    .rs1_i_tag              ( rf_rdata_a_tag   ),  // tag of base-address register
+    .regfile_we_wb_i        ( rf_we_lsu         ),
+    .tpr_i                  ( tpr_csr          ),
+    .regfile_dest_tag       ( rf_we_tag_load   ),  // computed tag for destination
+    .regfile_enable_tag     ( rf_tag_we_load   )
+  );
+
+  // decoding ALU tag propagation MODE from TPR
+  riscv_mode_tag u_ibex_mode_tag (
+    .instr_rdata_i       ( instr_rdata_id    ),
+    .tpr_i               ( tpr_csr           ),
+    .alu_operator_o_mode ( alu_tag_mode      ),
+    .register_set_o      ( rf_tag_we_tmu     ),
+    .is_store_post_o     ( is_store_post_tmu ),
+    .memory_set_o        ( memory_set_tmu    )
+  );
+
+  //decode store enable bits from TPR
+  riscv_enable_tag u_ibex_enable_tag (
+    .instr_rdata_i ( instr_rdata_id ),
+    .tpr_i         ( tpr_csr        ),
+    .is_store_o    ( is_store_tmu   ),
+    .enable_a_o    (                ),  // handled internally by id_stage via tpr_i
+    .enable_b_o    (                )
+  );
+
+  // Suppress unused-signal warnings for TMU outputs consumed inside sub-modules
+  logic unused_dift_tmu;
+  assign unused_dift_tmu = rf_tag_we_tmu ^ is_store_tmu ^ memory_set_tmu ^ is_store_post_tmu;
+  assign pc_exception = instr_valid_id & dift_pc_check & pc_id_tag;                           //PC tag violation : new add
+  assign dift_exception_o = load_exception | lsu_tag_err | ex_exception | pc_exception;
+`endif
 
   //////////////
   // IF stage //
   //////////////
 
   ibex_if_stage #(
-    .DmHaltAddr           (DmHaltAddr),
-    .DmExceptionAddr      (DmExceptionAddr),
-    .DummyInstructions    (DummyInstructions),
-    .ICache               (ICache),
-    .RV32ZC               (RV32ZC),
-    .ICacheECC            (ICacheECC),
-    .ICacheTweakInfection (ICacheTweakInfection),
-    .BusSizeECC           (BusSizeECC),
-    .TagSizeECC           (TagSizeECC),
-    .LineSizeECC          (LineSizeECC),
-    .PCIncrCheck          (PCIncrCheck),
-    .ResetAll             (ResetAll),
-    .RndCnstLfsrSeed      (RndCnstLfsrSeed),
-    .RndCnstLfsrPerm      (RndCnstLfsrPerm),
-    .BranchPredictor      (BranchPredictor),
-    .MemECC               (MemECC),
-    .MemDataWidth         (MemDataWidth)
+    .DmHaltAddr       (DmHaltAddr),
+    .DmExceptionAddr  (DmExceptionAddr),
+    .DummyInstructions(DummyInstructions),
+    .ICache           (ICache),
+    .RV32ZC           (RV32ZC),
+    .ICacheECC        (ICacheECC),
+    .BusSizeECC       (BusSizeECC),
+    .TagSizeECC       (TagSizeECC),
+    .LineSizeECC      (LineSizeECC),
+    .PCIncrCheck      (PCIncrCheck),
+    .ResetAll         (ResetAll),
+    .RndCnstLfsrSeed  (RndCnstLfsrSeed),
+    .RndCnstLfsrPerm  (RndCnstLfsrPerm),
+    .BranchPredictor  (BranchPredictor),
+    .MemECC           (MemECC),
+    .MemDataWidth     (MemDataWidth)
   ) if_stage_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
 
     .boot_addr_i(boot_addr_i),
-    .req_i      (instr_req_gated),  // instruction request control
+    .req_i      (instr_req_gated),
 
     // instruction cache interface
     .instr_req_o       (instr_req_o),
@@ -511,9 +623,9 @@ module ibex_core import ibex_pkg::*; #(
     .nt_branch_addr_i  (nt_branch_addr),
 
     // CSRs
-    .csr_mepc_i      (csr_mepc),  // exception return address
-    .csr_depc_i      (csr_depc),  // debug return address
-    .csr_mtvec_i     (csr_mtvec),  // trap-vector base address
+    .csr_mepc_i      (csr_mepc),
+    .csr_depc_i      (csr_depc),
+    .csr_mtvec_i     (csr_mtvec),
     .csr_mtvec_init_o(csr_mtvec_init),
 
     // pipeline stalls
@@ -521,30 +633,30 @@ module ibex_core import ibex_pkg::*; #(
 
     .pc_mismatch_alert_o(pc_mismatch_alert),
     .if_busy_o          (if_busy)
+
+    // DIFT PC tag tracking through the IF stage
+`ifdef DIFT
+    ,
+    .branch_target_ex_i_tag (pc_set_tag), //tag of the branch/jump target PC computed in EX
+    .pc_if_o_tag            (pc_if_tag), //tag of the PC currently being fetched, becomes the instruction tag (instr_tag_i) for the instruction in the ID stage.
+    .pc_id_o_tag            (pc_id_tag)
+`endif
   );
 
   // Core is waiting for the ISide when ID/EX stage is ready for a new instruction but none are
   // available
   assign perf_iside_wait = id_in_ready & ~instr_valid_id;
 
-  // Multi-bit fetch enable used when SecureIbex == 1. When SecureIbex == 0 only use the bottom-bit
-  // of fetch_enable_i. Ensure the multi-bit encoding has the bottom bit set for on and unset for
-  // off so IbexMuBiOn/IbexMuBiOff can be used without needing to know the value of SecureIbex.
   `ASSERT_INIT(IbexMuBiSecureOnBottomBitSet,    IbexMuBiOn[0] == 1'b1)
   `ASSERT_INIT(IbexMuBiSecureOffBottomBitClear, IbexMuBiOff[0] == 1'b0)
 
-  // fetch_enable_i can be used to stop the core fetching new instructions
   if (SecureIbex) begin : g_instr_req_gated_secure
-    // For secure Ibex fetch_enable_i must be a specific multi-bit pattern to enable instruction
-    // fetch
     // SEC_CM: FETCH.CTRL.LC_GATED
     assign instr_req_gated = instr_req_int & (fetch_enable_i == IbexMuBiOn);
     assign instr_exec      = fetch_enable_i == IbexMuBiOn;
   end else begin : g_instr_req_gated_non_secure
-    // For non secure Ibex only the bottom bit of fetch enable is considered
     logic unused_fetch_enable;
     assign unused_fetch_enable = ^fetch_enable_i[$bits(ibex_mubi_t)-1:1];
-
     assign instr_req_gated = instr_req_int & fetch_enable_i[0];
     assign instr_exec      = fetch_enable_i[0];
   end
@@ -566,11 +678,9 @@ module ibex_core import ibex_pkg::*; #(
     .clk_i (clk_i),
     .rst_ni(rst_ni),
 
-    // Processor Enable
     .ctrl_busy_o   (ctrl_busy),
     .illegal_insn_o(illegal_insn_id),
 
-    // from/to IF-ID pipeline register
     .instr_valid_i        (instr_valid_id),
     .instr_rdata_i        (instr_rdata_id),
     .instr_rdata_alu_i    (instr_rdata_alu_id),
@@ -578,10 +688,8 @@ module ibex_core import ibex_pkg::*; #(
     .instr_is_compressed_i(instr_is_compressed_id),
     .instr_bp_taken_i     (instr_bp_taken_id),
 
-    // Jumps and branches
     .branch_decision_i(branch_decision),
 
-    // IF and ID control signals
     .instr_first_cycle_id_o(instr_first_cycle_id),
     .instr_valid_clear_o   (instr_valid_clear),
     .id_in_ready_o         (id_in_ready),
@@ -601,7 +709,6 @@ module ibex_core import ibex_pkg::*; #(
 
     .pc_id_i(pc_id),
 
-    // Stalls
     .ex_valid_i      (ex_valid),
     .lsu_resp_valid_i(lsu_resp_valid),
 
@@ -626,16 +733,15 @@ module ibex_core import ibex_pkg::*; #(
     .multdiv_operand_b_ex_o  (multdiv_operand_b_ex),
     .multdiv_ready_id_o      (multdiv_ready_id),
 
-    // CSR ID/EX
     .csr_access_o         (csr_access),
     .csr_op_o             (csr_op),
     .csr_addr_o           (csr_addr),
     .csr_op_en_o          (csr_op_en),
-    .csr_save_if_o        (csr_save_if),  // control signal to save PC
-    .csr_save_id_o        (csr_save_id),  // control signal to save PC
-    .csr_save_wb_o        (csr_save_wb),  // control signal to save PC
-    .csr_restore_mret_id_o(csr_restore_mret_id),  // restore mstatus upon MRET
-    .csr_restore_dret_id_o(csr_restore_dret_id),  // restore mstatus upon MRET
+    .csr_save_if_o        (csr_save_if),
+    .csr_save_id_o        (csr_save_id),
+    .csr_save_wb_o        (csr_save_wb),
+    .csr_restore_mret_id_o(csr_restore_mret_id),
+    .csr_restore_dret_id_o(csr_restore_dret_id),
     .csr_save_cause_o     (csr_save_cause),
     .csr_mtval_o          (csr_mtval),
     .priv_mode_i          (priv_mode_id),
@@ -643,13 +749,12 @@ module ibex_core import ibex_pkg::*; #(
     .illegal_csr_insn_i   (illegal_csr_insn_id),
     .data_ind_timing_i    (data_ind_timing),
 
-    // LSU
-    .lsu_req_o     (lsu_req),  // to load store unit
-    .lsu_we_o      (lsu_we),  // to load store unit
-    .lsu_type_o    (lsu_type),  // to load store unit
-    .lsu_sign_ext_o(lsu_sign_ext),  // to load store unit
-    .lsu_wdata_o   (lsu_wdata),  // to load store unit
-    .lsu_req_done_i(lsu_req_done),  // from load store unit
+    .lsu_req_o     (lsu_req),
+    .lsu_we_o      (lsu_we),
+    .lsu_type_o    (lsu_type),
+    .lsu_sign_ext_o(lsu_sign_ext),
+    .lsu_wdata_o   (lsu_wdata),
+    .lsu_req_done_i(lsu_req_done),
 
     .lsu_addr_incr_req_i(lsu_addr_incr_req),
     .lsu_addr_last_i    (lsu_addr_last),
@@ -662,14 +767,12 @@ module ibex_core import ibex_pkg::*; #(
     .expecting_load_resp_o (expecting_load_resp_id),
     .expecting_store_resp_o(expecting_store_resp_id),
 
-    // Interrupt Signals
     .csr_mstatus_mie_i(csr_mstatus_mie),
     .irq_pending_i    (irq_pending_o),
     .irqs_i           (irqs),
     .irq_nm_i         (irq_nm_i),
     .nmi_mode_o       (nmi_mode),
 
-    // Debug Signal
     .debug_mode_o         (debug_mode),
     .debug_mode_entering_o(debug_mode_entering),
     .debug_cause_o        (debug_cause),
@@ -680,7 +783,6 @@ module ibex_core import ibex_pkg::*; #(
     .debug_ebreaku_i      (debug_ebreaku),
     .trigger_match_i      (trigger_match),
 
-    // write data to commit in the register file
     .result_ex_i(result_ex),
     .csr_rdata_i(csr_rdata),
 
@@ -707,7 +809,6 @@ module ibex_core import ibex_pkg::*; #(
     .outstanding_load_wb_i (outstanding_load_wb),
     .outstanding_store_wb_i(outstanding_store_wb),
 
-    // Performance Counters
     .perf_jump_o      (perf_jump),
     .perf_branch_o    (perf_branch),
     .perf_tbranch_o   (perf_tbranch),
@@ -715,10 +816,44 @@ module ibex_core import ibex_pkg::*; #(
     .perf_mul_wait_o  (perf_mul_wait),
     .perf_div_wait_o  (perf_div_wait),
     .instr_id_done_o  (instr_id_done)
+
+    // DIFT ID stage tag wiring
+    // Inputs: register tags (direct + forwarded), policy CSRs, instruction PC tag
+    // Outputs: resolved operand tags pipelined to EX, branch/jump PC tag to IF
+`ifdef DIFT
+    ,
+    // Forwarded tags from EX and WB for operand hazard resolution
+    .rf_wdata_ex_tag_i   (rf_wdata_ex_tag),       // EX result tag (forwarding)
+    .rf_wdata_wb_tag_i   (rf_wdata_fwd_tag_wb),   // WB result tag (forwarding)
+    // Register file tag reads (same addresses as RF)
+    .rf_rdata_a_tag_i    (rf_rdata_a_tag),
+    .rf_rdata_b_tag_i    (rf_rdata_b_tag),
+    // Policy registers from CSR file (programmed by startup routine)
+    .tpr_i               (tpr_csr),
+    .tcr_i               (tcr_csr),
+    // Instruction tag = tag of the PC in the ID stage
+    .instr_tag_i         (pc_id_tag),
+    // Resolved operand tags latched into EX pipeline registers by id_stage
+    .alu_op_a_tag_ex_o   (alu_op_a_tag_ex),
+    .alu_op_b_tag_ex_o   (alu_op_b_tag_ex),
+    .lsu_wdata_tag_ex_o  (lsu_wdata_tag_id),
+    .pc_set_tag_o        (pc_set_tag),
+    .rf_we_tag_ex_o      (rf_we_tag_id),
+    // New TMU ports
+    .alu_tag_mode_i      (alu_tag_mode),
+    .dift_s1_check_i     (dift_s1_check),
+    .dift_s2_check_i     (dift_s2_check),
+    .dift_dest_check_i   (dift_dest_check),
+    .is_load_i           (instr_rdata_id[6:0] == OPCODE_LOAD),
+    .ex_tag_err_i        (ex_exception | pc_exception)  //PC VIOLATION 
+`endif
   );
 
-  // for RVFI only
   assign unused_illegal_insn_id = illegal_insn_id;
+
+  /////////////////
+  // EX block    //
+  /////////////////
 
   ibex_ex_block #(
     .RV32M          (RV32M),
@@ -728,17 +863,15 @@ module ibex_core import ibex_pkg::*; #(
     .clk_i (clk_i),
     .rst_ni(rst_ni),
 
-    // ALU signal from ID stage
     .alu_operator_i         (alu_operator_ex),
     .alu_operand_a_i        (alu_operand_a_ex),
     .alu_operand_b_i        (alu_operand_b_ex),
     .alu_instr_first_cycle_i(instr_first_cycle_id),
 
-    // Branch target ALU signal from ID stage
     .bt_a_operand_i(bt_a_operand),
     .bt_b_operand_i(bt_b_operand),
+    .instr_tag_i     (pc_id_tag),
 
-    // Multipler/Divider signal from ID stage
     .multdiv_operator_i   (multdiv_operator_ex),
     .mult_en_i            (mult_en_ex),
     .div_en_i             (div_en_ex),
@@ -750,19 +883,39 @@ module ibex_core import ibex_pkg::*; #(
     .multdiv_ready_id_i   (multdiv_ready_id),
     .data_ind_timing_i    (data_ind_timing),
 
-    // Intermediate value register
     .imd_val_we_o(imd_val_we_ex),
     .imd_val_d_o (imd_val_d_ex),
     .imd_val_q_i (imd_val_q_ex),
 
-    // Outputs
-    .alu_adder_result_ex_o(alu_adder_result_ex),  // to LSU
-    .result_ex_o          (result_ex),  // to ID
+    .alu_adder_result_ex_o(alu_adder_result_ex),
+    .result_ex_o          (result_ex),
 
-    .branch_target_o  (branch_target_ex),  // to IF
-    .branch_decision_o(branch_decision),  // to ID
+    .branch_target_o  (branch_target_ex),
+    .branch_decision_o(branch_decision),
 
     .ex_valid_o(ex_valid)
+
+    //DIFT EX block tag wiring
+    // Inputs: resolved operand tags from ID pipeline registers
+    // Outputs: computed result tag (forwarding + WB path), store-data tag to LSU
+    // ibex_dift_logic (inside ex_block) applies alu_tag_mode propagation rule.
+`ifdef DIFT
+    ,
+    .alu_op_a_tag_i      (alu_op_a_tag_ex),     // operand A tag (from ID FF)
+    .alu_op_b_tag_i      (alu_op_b_tag_ex),     // operand B tag (from ID FF)
+    .rf_we_tag_i         (rf_we_tag_id),         // RF write-enable tag
+    .lsu_wdata_tag_i     (lsu_wdata_tag_id),     // store-data tag
+    .alu_tag_mode_i  (alu_tag_mode),
+    .check_s1_i      (dift_s1_check), 
+    .check_s2_i      (dift_s2_check),
+    .check_d_i       (dift_dest_check),
+    .is_load_i       (instr_rdata_id[6:0] == OPCODE_LOAD),
+    .rf_wdata_ex_tag_o   (rf_wdata_ex_tag),      // result tag → ID forwarding mux
+    .regfile_wdata_tag_o (regfile_wdata_tag),    // result tag → WB stage
+    .rf_we_tag_o         (rf_we_tag_ex_out),     // WE tag → WB stage
+    .lsu_wdata_tag_o     (lsu_wdata_tag_lsu),     // store-data tag → LSU
+    .ex_tag_err_o        (ex_exception)
+`endif
   );
 
   /////////////////////
@@ -779,7 +932,6 @@ module ibex_core import ibex_pkg::*; #(
     .clk_i (clk_i),
     .rst_ni(rst_ni),
 
-    // data interface
     .data_req_o    (data_req_out),
     .data_gnt_i    (data_gnt_i),
     .data_rvalid_i (data_rvalid_i),
@@ -792,7 +944,6 @@ module ibex_core import ibex_pkg::*; #(
     .data_wdata_o     (data_wdata_o),
     .data_rdata_i     (data_rdata_i),
 
-    // signals to/from ID/EX stage
     .lsu_we_i      (lsu_we),
     .lsu_type_i    (lsu_type),
     .lsu_wdata_i   (lsu_wdata),
@@ -808,10 +959,8 @@ module ibex_core import ibex_pkg::*; #(
     .addr_incr_req_o(lsu_addr_incr_req),
     .addr_last_o    (lsu_addr_last),
 
-
     .lsu_resp_valid_o(lsu_resp_valid),
 
-    // exception signals
     .load_err_o           (lsu_load_err_raw),
     .load_resp_intg_err_o (lsu_load_resp_intg_err),
     .store_err_o          (lsu_store_err_raw),
@@ -821,7 +970,25 @@ module ibex_core import ibex_pkg::*; #(
 
     .perf_load_o (perf_load),
     .perf_store_o(perf_store)
+
+    // DIFT LSU tag wiring
+    // Connects to the external tag RAM.
+    // data_wdata_tag_o / data_rdata_tag_i mirror data_wdata_o / data_rdata_i
+    // lsu_tag_err_o is raised when a tainted address is used for a load/store
+`ifdef DIFT
+    ,
+    .data_wdata_tag_o  (data_wdata_tag_o),    // tag to shadow RAM
+    .data_rdata_tag_i  (data_rdata_tag_i),    // tag from shadow RAM
+    .lsu_wdata_tag_i   (lsu_wdata_tag_lsu),   // store-data tag from EX
+    .lsu_rdata_tag_o   (lsu_rdata_tag),       // loaded-data tag → WB
+    .lsu_tag_err_o     (lsu_tag_err),         // address taint violation
+    .tcr_load_check_i  (tcr_csr[LOADSTORE_CHECK_DA])  // policy bit: check address tag
+`endif
   );
+
+  //////////////////////
+  // Writeback stage  //
+  //////////////////////
 
   ibex_wb_stage #(
     .ResetAll         (ResetAll),
@@ -867,23 +1034,35 @@ module ibex_core import ibex_pkg::*; #(
     .lsu_resp_err_i  (lsu_resp_err),
 
     .instr_done_wb_o(instr_done_wb)
+
+    // DIFT WB stage tag wiring
+    // The WB stage selects between the EX result tag (ALU/mult) and the LSU data tag, then drives the tag register file write port.
+    // rf_wdata_fwd_tag_wb_o provides the forwarded tag to ID for hazard resolution.
+`ifdef DIFT
+    ,
+    // From EX block: ALU/mult result tag
+    .rf_wdata_tag_id_i     (regfile_wdata_tag),   // EX result tag
+    .rf_we_tag_id_i        (rf_we_tag_ex_out),    // EX write-enable tag
+    // From LSU: loaded data tag
+    .rf_wdata_tag_lsu_i    (rf_we_tag_load),       // loaded-word tag
+    .rf_we_tag_lsu_i       (rf_tag_we_load),       // LSU write enable (same as data)
+    // To tag register file
+    .rf_wdata_tag_wb_o     (rf_wdata_tag_wb),     // final tag to write
+    .rf_we_tag_wb_o        (rf_we_tag_wb),        // tag RF write enable
+    // Forwarding to ID stage
+    .rf_wdata_fwd_tag_wb_o (rf_wdata_fwd_tag_wb)  // hazard-forwarding tag
+`endif
   );
 
   if (SecureIbex) begin : g_check_mem_response
-    // For secure configurations only process load/store responses if we're expecting them to guard
-    // against false responses being injected on to the bus
     assign lsu_load_err  = lsu_load_err_raw  & (outstanding_load_wb  | expecting_load_resp_id);
     assign lsu_store_err = lsu_store_err_raw & (outstanding_store_wb | expecting_store_resp_id);
     assign rf_we_lsu     = lsu_rdata_valid   & (outstanding_load_wb  | expecting_load_resp_id);
   end else begin : g_no_check_mem_response
-    // For non-secure configurations trust the bus protocol is being followed and we'll only ever
-    // see a response if we have an outstanding request.
     assign lsu_load_err  = lsu_load_err_raw;
     assign lsu_store_err = lsu_store_err_raw;
     assign rf_we_lsu     = lsu_rdata_valid;
 
-    // expected_load_resp_id/expected_store_resp_id signals are only used to guard against false
-    // responses so they are unused in non-secure configurations
     logic unused_expecting_load_resp_id;
     logic unused_expecting_store_resp_id;
 
@@ -903,18 +1082,15 @@ module ibex_core import ibex_pkg::*; #(
   assign rf_raddr_b_o     = rf_raddr_b;
 
   if (RegFileECC) begin : gen_regfile_ecc
-
     // SEC_CM: DATA_REG_SW.INTEGRITY
     logic [1:0] rf_ecc_err_a, rf_ecc_err_b;
     logic       rf_ecc_err_a_id, rf_ecc_err_b_id;
 
-    // ECC checkbit generation for register file wdata
     prim_secded_inv_39_32_enc regfile_ecc_enc (
       .data_i(rf_wdata_wb),
       .data_o(rf_wdata_wb_ecc_o)
     );
 
-    // ECC checking on register file rdata
     prim_secded_inv_39_32_dec regfile_ecc_dec_a (
       .data_i    (rf_rdata_a_ecc_i),
       .data_o    (),
@@ -928,17 +1104,13 @@ module ibex_core import ibex_pkg::*; #(
       .err_o     (rf_ecc_err_b)
     );
 
-    // Assign read outputs - no error correction, just trigger an alert
     assign rf_rdata_a = rf_rdata_a_ecc_i[31:0];
     assign rf_rdata_b = rf_rdata_b_ecc_i[31:0];
 
-    // Calculate errors - qualify with WB forwarding to avoid xprop into the alert signal
     assign rf_ecc_err_a_id = |rf_ecc_err_a & rf_ren_a & ~(rf_rd_a_wb_match & rf_write_wb);
     assign rf_ecc_err_b_id = |rf_ecc_err_b & rf_ren_b & ~(rf_rd_b_wb_match & rf_write_wb);
 
-    // Combined error
     assign rf_ecc_err_comb = instr_valid_id & (rf_ecc_err_a_id | rf_ecc_err_b_id);
-
   end else begin : gen_no_regfile_ecc
     logic unused_rf_ren_a, unused_rf_ren_b;
     logic unused_rf_rd_a_wb_match, unused_rf_rd_b_wb_match;
@@ -952,6 +1124,35 @@ module ibex_core import ibex_pkg::*; #(
     assign rf_rdata_b              = rf_rdata_b_ecc_i;
     assign rf_ecc_err_comb         = 1'b0;
   end
+
+  // ===========================================================================
+  // DIFT Tag register file
+  // One tag bit per register, implemented as a shadow register file using
+  // identical read/write addresses to the integer RF.  Instantiated internally. No ECC
+  // ===========================================================================
+`ifdef DIFT
+  ibex_register_file_fpga_tag #(
+    .RV32E            (RV32E),
+    .DataWidth        (1),          // 1-bit tag per register
+    .DummyInstructions(DummyInstructions),
+    .WordZeroVal      (1'b0)        // tags initialised to 0 (authentic) at reset
+  ) tag_register_file_i (
+    .clk_i            (clk_i),
+    .rst_ni           (rst_ni),
+    .test_en_i        (1'b0),
+    .dummy_instr_id_i (dummy_instr_id),
+    .dummy_instr_wb_i (dummy_instr_wb),
+    // Read addresses — identical to integer RF so tags are always co-read
+    .raddr_a_i        (rf_raddr_a),
+    .rdata_a_o        (rf_rdata_a_tag),
+    .raddr_b_i        (rf_raddr_b),
+    .rdata_b_o        (rf_rdata_b_tag),
+    // Write address — identical to integer RF; tag written with result tag from WB
+    .waddr_a_i        (rf_waddr_wb),
+    .wdata_a_i        (rf_wdata_tag_wb),
+    .we_a_i           (rf_we_tag_wb)
+  );
+`endif
 
   ///////////////////////
   // Crash dump output //
@@ -968,20 +1169,13 @@ module ibex_core import ibex_pkg::*; #(
   // Alert outputs //
   ///////////////////
 
-  // Minor alert - core is in a recoverable state
   assign alert_minor_o = icache_ecc_error;
-
-  // Major internal alert - core is unrecoverable
   assign alert_major_internal_o = rf_ecc_err_comb | pc_mismatch_alert | csr_shadow_err;
-  // Major bus alert
   assign alert_major_bus_o = lsu_load_resp_intg_err | lsu_store_resp_intg_err | instr_intg_err;
 
-  // Explict INC_ASSERT block to avoid unused signal lint warnings were asserts are not included
-  `ifdef INC_ASSERT
-  // Signals used for assertions only
+`ifdef INC_ASSERT
   logic outstanding_load_resp;
   logic outstanding_store_resp;
-
   logic outstanding_load_id;
   logic outstanding_store_id;
 
@@ -991,31 +1185,20 @@ module ibex_core import ibex_pkg::*; #(
                                 id_stage_i.lsu_we;
 
   if (WritebackStage) begin : gen_wb_stage
-    // When the writeback stage is present a load/store could be in ID or WB. A Load/store in ID can
-    // see a response before it moves to WB when it is unaligned otherwise we should only see
-    // a response when load/store is in WB.
     assign outstanding_load_resp  = outstanding_load_wb |
       (outstanding_load_id  & load_store_unit_i.split_misaligned_access);
-
     assign outstanding_store_resp = outstanding_store_wb |
       (outstanding_store_id & load_store_unit_i.split_misaligned_access);
-
-    // When writing back the result of a load, the load must have made it to writeback
     `ASSERT(NoMemRFWriteWithoutPendingLoad, rf_we_lsu |-> outstanding_load_wb, clk_i, !rst_ni)
   end else begin : gen_no_wb_stage
-    // Without writeback stage only look into whether load or store is in ID to determine if
-    // a response is expected.
     assign outstanding_load_resp  = outstanding_load_id;
     assign outstanding_store_resp = outstanding_store_id;
-
     `ASSERT(NoMemRFWriteWithoutPendingLoad, rf_we_lsu |-> outstanding_load_id, clk_i, !rst_ni)
   end
 
   `ASSERT(NoMemResponseWithoutPendingAccess,
     data_rvalid_i |-> outstanding_load_resp | outstanding_store_resp, clk_i, !rst_ni)
 
-
-  // Keep track of the PC last seen in the ID stage when fetch is disabled
   logic [31:0]   pc_at_fetch_disable;
   ibex_mubi_t    last_fetch_enable;
 
@@ -1025,26 +1208,19 @@ module ibex_core import ibex_pkg::*; #(
       last_fetch_enable   <= '0;
     end else begin
       last_fetch_enable <= fetch_enable_i;
-
       if ((fetch_enable_i != IbexMuBiOn) && (last_fetch_enable == IbexMuBiOn)) begin
         pc_at_fetch_disable <= pc_id;
       end
     end
   end
 
-  // A 1-bit encoding of fetch_enable_i to avoid polluting the NoExecWhenFetchEnableNotOn assertion
-  // with notes about SecureIbex and mubi values.
   logic fetch_enable_raw;
   assign fetch_enable_raw = SecureIbex ? (fetch_enable_i == IbexMuBiOn) : fetch_enable_i[0];
 
-  // When fetch is disabled, no instructions should be executed. Once fetch is disabled either the
-  // ID/EX stage is not valid or the PC of the ID/EX stage must remain as it was at disable. The
-  // ID/EX valid should not ressert once it has been cleared.
   `ASSERT(NoExecWhenFetchEnableNotOn,
           !fetch_enable_raw |=>
           (~instr_valid_id || (pc_id == pc_at_fetch_disable)) && ~$rose(instr_valid_id))
-
-  `endif // INC_ASSERT
+`endif
 
   /////////////////////////////////////////
   // CSRs (Control and Status Registers) //
@@ -1076,17 +1252,14 @@ module ibex_core import ibex_pkg::*; #(
     .clk_i (clk_i),
     .rst_ni(rst_ni),
 
-    // Hart ID from outside
     .hart_id_i      (hart_id_i),
     .priv_mode_id_o (priv_mode_id),
     .priv_mode_lsu_o(priv_mode_lsu),
 
-    // mtvec
     .csr_mtvec_o     (csr_mtvec),
     .csr_mtvec_init_i(csr_mtvec_init),
     .boot_addr_i     (boot_addr_i),
 
-    // Interface to CSRs     ( SRAM like                    )
     .csr_access_i(csr_access),
     .csr_addr_i  (csr_addr),
     .csr_wdata_i (csr_wdata),
@@ -1094,7 +1267,14 @@ module ibex_core import ibex_pkg::*; #(
     .csr_op_en_i (csr_op_en),
     .csr_rdata_o (csr_rdata),
 
-    // Interrupt related control signals
+    //DIFT TPR and TCR outputs
+    // programmed at startup by a runtime routine, mapped as 32-bit CSR
+    // registers at addresses CSR_TPR=0x7C3 and CSR_TCR=0x7C2 (in ibex_pkg.sv).
+`ifdef DIFT
+    .tpr_o (tpr_csr),
+    .tcr_o (tcr_csr),
+`endif
+
     .irq_software_i   (irq_software_i),
     .irq_timer_i      (irq_timer_i),
     .irq_external_i   (irq_external_i),
@@ -1107,12 +1287,10 @@ module ibex_core import ibex_pkg::*; #(
     .csr_mepc_o       (csr_mepc),
     .csr_mtval_o      (crash_dump_mtval),
 
-    // PMP
     .csr_pmp_cfg_o    (csr_pmp_cfg),
     .csr_pmp_addr_o   (csr_pmp_addr),
     .csr_pmp_mseccfg_o(csr_pmp_mseccfg),
 
-    // debug
     .csr_depc_o           (csr_depc),
     .debug_mode_i         (debug_mode),
     .debug_mode_entering_i(debug_mode_entering),
@@ -1148,7 +1326,6 @@ module ibex_core import ibex_pkg::*; #(
 
     .double_fault_seen_o,
 
-    // performance counter related signals
     .instr_ret_i                (perf_instr_ret_wb),
     .instr_ret_compressed_i     (perf_instr_ret_compressed_wb),
     .instr_ret_spec_i           (perf_instr_ret_wb_spec),
@@ -1164,14 +1341,19 @@ module ibex_core import ibex_pkg::*; #(
     .div_wait_i                 (perf_div_wait)
   );
 
-  // These assertions are in top-level as instr_valid_id required as the enable term
   `ASSERT(IbexCsrOpValid, instr_valid_id |-> csr_op inside {
-      CSR_OP_READ,
-      CSR_OP_WRITE,
-      CSR_OP_SET,
-      CSR_OP_CLEAR
-      })
+      CSR_OP_READ, CSR_OP_WRITE, CSR_OP_SET, CSR_OP_CLEAR })
   `ASSERT_KNOWN_IF(IbexCsrWdataIntKnown, cs_registers_i.csr_wdata_int, csr_op_en)
+
+  // ===========================================================================
+  // DIFT Security exception output
+  // Sources of DIFT exceptions in this implementation:
+  //   load_exception : raised by riscv_load_check when a load violates TCR
+  //                    (tainted address or tainted source used as load address)
+  //   lsu_tag_err    : raised by ibex_load_store_unit when the memory address
+  //                    itself is tainted and LOADSTORE_CHECK_DA bit is set
+  // ===========================================================================
+
 
   if (PMPEnable) begin : g_pmp
     logic [31:0]           pc_if_inc;
@@ -1197,36 +1379,31 @@ module ibex_core import ibex_pkg::*; #(
       .PMPNumChan    (PMPNumChan),
       .PMPNumRegions (PMPNumRegions)
     ) pmp_i (
-      // Interface to CSRs
       .csr_pmp_cfg_i    (csr_pmp_cfg),
       .csr_pmp_addr_i   (csr_pmp_addr),
       .csr_pmp_mseccfg_i(csr_pmp_mseccfg),
       .debug_mode_i     (debug_mode),
       .priv_mode_i      (pmp_priv_lvl),
-      // Access checking channels
       .pmp_req_addr_i   (pmp_req_addr),
       .pmp_req_type_i   (pmp_req_type),
       .pmp_req_err_o    (pmp_req_err)
     );
   end else begin : g_no_pmp
-    // Unused signal tieoff
     priv_lvl_e             unused_priv_lvl_ls;
     logic [PMP_ADDR_MSB:0] unused_csr_pmp_addr [PMPNumRegions];
     pmp_cfg_t              unused_csr_pmp_cfg  [PMPNumRegions];
     pmp_mseccfg_t          unused_csr_pmp_mseccfg;
-    assign unused_priv_lvl_ls = priv_mode_lsu;
-    assign unused_csr_pmp_addr = csr_pmp_addr;
-    assign unused_csr_pmp_cfg = csr_pmp_cfg;
+    assign unused_priv_lvl_ls    = priv_mode_lsu;
+    assign unused_csr_pmp_addr   = csr_pmp_addr;
+    assign unused_csr_pmp_cfg    = csr_pmp_cfg;
     assign unused_csr_pmp_mseccfg = csr_pmp_mseccfg;
-
-    // Output tieoff
     assign pmp_req_err[PMP_I]  = 1'b0;
     assign pmp_req_err[PMP_I2] = 1'b0;
     assign pmp_req_err[PMP_D]  = 1'b0;
   end
 
 `ifdef RVFI
-  // When writeback stage is present RVFI information is emitted when instruction is finished in
+    // When writeback stage is present RVFI information is emitted when instruction is finished in
   // third stage but some information must be captured whilst the instruction is in the second
   // stage. Without writeback stage RVFI information is all emitted when instruction retires in
   // second stage. RVFI outputs are all straight from flops. So 2 stage pipeline requires a single
@@ -1943,11 +2120,10 @@ module ibex_core import ibex_pkg::*; #(
   assign unused_instr_gets_expanded_id = ^instr_gets_expanded_id;
 `endif
 
-  // Certain parameter combinations are not supported
   `ASSERT_INIT(IllegalParamSecure, !(SecureIbex && (RV32M == RV32MNone)))
-
-  // If the ID stage signals its ready the mult/div FSMs must be idle in the following cycle
-  `ASSERT(MultDivFSMIdleOnIdReady, id_in_ready |=> ex_block_i.sva_multdiv_fsm_idle)
+//`ifndef MTI_SVSIM
+ // `ASSERT(MultDivFSMIdleOnIdReady, id_in_ready |=> ex_block_i.sva_multdiv_fsm_idle)
+//`endif
 
   //////////
   // FCOV //

@@ -190,6 +190,37 @@ module ibex_id_stage #(
   output logic                      perf_mul_wait_o,
   output logic                      perf_div_wait_o,
   output logic                      instr_id_done_o
+
+  // DIFT signals
+  `ifdef DIFT
+   ,
+    input  logic                      rf_wdata_ex_tag_i,     // forwarded data's tag from EX stage 
+    input  logic                      rf_wdata_wb_tag_i,     // forwarded data's tag from WB stage 
+    input  logic                      rf_rdata_a_tag_i,      // rs1 tag from regfile
+    input  logic                      rf_rdata_b_tag_i,      // rs2 tag from regfile
+    
+    // Policy & Context
+    input  logic [31:0]               tpr_i,                 // Policy Register
+    input  logic [31:0]               tcr_i,                 // Control Register
+    input  logic                      instr_tag_i,           // tag of the instruction in ID stage
+
+    // Shadow Control for EX Stage
+    output logic                      alu_op_a_tag_ex_o,     // resolved tag for ALU operand A
+    output logic                      alu_op_b_tag_ex_o,     // resolved tag for ALU operand B
+    output logic                      lsu_wdata_tag_ex_o,    // resolved tag for LSU write data
+    output logic                      pc_set_tag_o,          // tag for PC incase of tainted branch/jump
+    output logic                      rf_we_tag_ex_o,         // tag to be updated in regfile on writeback 
+
+    //new addition
+    // Inputs from core-level TMU (new)
+    input  logic [ibex_pkg::ALU_MODE_WIDTH-1:0] alu_tag_mode_i,
+    input  logic                      dift_s1_check_i,
+    input  logic                      dift_s2_check_i,
+    input  logic                      dift_dest_check_i,
+    input  logic                      is_load_i,
+    //output logic                      ex_tag_err_o           // from ex_block, to controller
+    input  logic                      ex_tag_err_i           // from ex_block, to controller
+`endif
 );
 
   import ibex_pkg::*;
@@ -296,6 +327,40 @@ module ibex_id_stage #(
 
   logic [31:0] alu_operand_a;
   logic [31:0] alu_operand_b;
+
+  //DIFT specific local signals
+  `ifdef DIFT
+    // register data tags
+    //logic        regfile_data_ra_id_tag;
+    //logic        regfile_data_rb_id_tag;
+
+    // Resolved Operand tags after tag muxing and forwarding
+    logic        alu_operand_a_tag;
+    logic        alu_operand_b_tag;
+
+    // Forwarded tags from id stage 
+    logic        operand_a_fw_id_tag;
+    logic        operand_b_fw_id_tag;
+
+    // Internal Logic & Gating 
+    logic        jump_target_tag;
+    logic        is_store;
+    //logic        enable_a;
+    //logic        enable_b;
+  
+    // Policy & Classification Checks
+    //logic        check_s1_tag;
+    //logic        check_s2_tag;
+    //logic        check_d_tag;
+  
+    // Execution Context
+    //logic        execute_pc_tag;
+    //logic        exception_tag;
+  
+    // Set/Write Enables
+    logic        register_set_tag;
+    //logic        memory_set_tag;
+  `endif
 
   /////////////
   // LSU Mux //
@@ -635,7 +700,52 @@ module ibex_id_stage #(
     // Performance Counters
     .perf_jump_o   (perf_jump_o),
     .perf_tbranch_o(perf_tbranch_o)
+
+`ifdef DIFT
+    ,
+    .lsu_tag_err_i         (1'b0),              // not used to flush in ID stage
+    .ex_tag_err_i          (ex_tag_err_i),     // from EX stage, used to flush on tag errors that are detected too late to prevent the instruction from entering EX (e.g. memory tag errors)
+    .tag_err_o             (),
+    .tcr_execute_pc_check_i(tcr_i[EXECUTE_PC]) //checks if execute_pc bit enabled in TCR
+`endif
   );
+
+  `ifdef DIFT
+  // 1. Forwarding Muxes — use output ports which are always driven regardless of WB stage
+  // rf_rd_a_wb_match_o == 0 when WritebackStage=0 (no forwarding), driven by gen_stall_mem otherwise
+  assign operand_a_fw_id_tag = (rf_rd_a_wb_match_o & rf_write_wb_i) ? rf_wdata_wb_tag_i : rf_rdata_a_tag_i;
+  assign operand_b_fw_id_tag = (rf_rd_b_wb_match_o & rf_write_wb_i) ? rf_wdata_wb_tag_i : rf_rdata_b_tag_i;
+
+
+  // 2. ALU Operand Tag Muxing 
+  //trusted operand but untrusted memory region = tainted result tag
+  //assign alu_operand_a_tag = ((alu_op_a_mux_sel == OP_A_REG_A) ? operand_a_fw_id_tag : (alu_op_a_mux_sel == OP_A_CURRPC)   ? instr_tag_i : 1'b0) | instr_tag_i;
+  //assign alu_operand_b_tag = ((alu_op_b_mux_sel == OP_B_REG_B) ? operand_b_fw_id_tag : 1'b0) | instr_tag_i;
+  assign alu_operand_a_tag = (alu_op_a_mux_sel == OP_A_REG_A)  ? operand_a_fw_id_tag : (alu_op_a_mux_sel == OP_A_CURRPC) ? instr_tag_i : 1'b0;
+  assign alu_operand_b_tag = (alu_op_b_mux_sel == OP_B_REG_B)  ? operand_b_fw_id_tag : 1'b0;
+
+  // 3. Control Flow & Policy
+  //jump_target_tag is ORed result of the register operand tag and the instruction tag.
+  assign jump_target_tag   = (jump_in_dec && (instr_rdata_i[6:0] == 7'h67)) ? (operand_a_fw_id_tag | instr_tag_i) : (jump_in_dec || branch_in_dec) ? instr_tag_i : 1'b0;
+  
+  assign is_store          = lsu_req_dec & lsu_we;
+  assign register_set_tag  = rf_we_dec;
+
+  // 4. Policy Checks
+  //assign check_s1_tag      = rf_ren_a; 
+  //assign check_s2_tag      = rf_ren_b;
+
+//modelsim testing
+  // Tag operands must be combinational to match integer operand timing in 2-stage pipeline.
+  // Ibex ID and EX execute in the same cycle; registering these caused a 1-cycle lag,
+  // making the EX block use the previous instruction's stale tags.
+  assign alu_op_a_tag_ex_o  = alu_operand_a_tag;
+  assign alu_op_b_tag_ex_o  = alu_operand_b_tag;
+  assign lsu_wdata_tag_ex_o = is_store ? (operand_b_fw_id_tag | instr_tag_i) : 1'b0;
+  assign pc_set_tag_o       = jump_target_tag;
+  assign rf_we_tag_ex_o     = register_set_tag;
+
+`endif
 
   assign multdiv_en_dec   = mult_en_dec | div_en_dec;
 
@@ -765,13 +875,38 @@ module ibex_id_stage #(
   typedef enum logic { FIRST_CYCLE, MULTI_CYCLE } id_fsm_e;
   id_fsm_e id_fsm_q, id_fsm_d;
 
-  always_ff @(posedge clk_i or negedge rst_ni) begin : id_pipeline_reg
+  /*always_ff @(posedge clk_i or negedge rst_ni) begin : id_pipeline_reg
     if (!rst_ni) begin
       id_fsm_q <= FIRST_CYCLE;
+      `ifdef DIFT
+        // Clear tags on reset to prevent false security traps
+        alu_op_a_tag_ex_o   <= 1'b0;
+        alu_op_b_tag_ex_o   <= 1'b0;
+        lsu_wdata_tag_ex_o  <= 1'b0;
+        pc_set_tag_o        <= 1'b0;
+        rf_we_tag_ex_o      <= 1'b0;
+      `endif
     end else if (instr_executing) begin
       id_fsm_q <= id_fsm_d;
+     `ifdef DIFT
+        alu_op_a_tag_ex_o   <= alu_operand_a_tag;
+        alu_op_b_tag_ex_o   <= alu_operand_b_tag;
+        lsu_wdata_tag_ex_o  <= is_store ? (operand_b_fw_id_tag | instr_tag_i) : 1'b0;
+        pc_set_tag_o        <= jump_target_tag;
+        rf_we_tag_ex_o      <= register_set_tag;
+      `endif
     end
+  end */
+
+  //modelsim testing
+  // AFTER:
+always_ff @(posedge clk_i or negedge rst_ni) begin : id_pipeline_reg
+  if (!rst_ni) begin
+    id_fsm_q <= FIRST_CYCLE;
+  end else if (instr_executing) begin
+    id_fsm_q <= id_fsm_d;
   end
+end
 
   // ID/EX stage can be in two states, FIRST_CYCLE and MULTI_CYCLE. An instruction enters
   // MULTI_CYCLE if it requires multiple cycles to complete regardless of stalls and other
@@ -896,9 +1031,7 @@ module ibex_id_stage #(
   assign instr_first_cycle_id_o = instr_first_cycle;
 
   if (WritebackStage) begin : gen_stall_mem
-    // Register read address matches write address in WB
-    logic rf_rd_a_wb_match;
-    logic rf_rd_b_wb_match;
+
     // Hazard between registers being read and written
     logic rf_rd_a_hz;
     logic rf_rd_b_hz;

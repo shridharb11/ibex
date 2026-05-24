@@ -59,6 +59,25 @@ module ibex_wb_stage #(
   input logic                      lsu_resp_err_i,
 
   output logic                     instr_done_wb_o
+
+  //DIFT signals
+  `ifdef DIFT
+    ,
+    // From EX Block / ID Stage
+    input  logic                     rf_wdata_tag_id_i,     // Result tag (ALU/Mult)
+    input  logic                     rf_we_tag_id_i,        // Write enable tag
+  
+    // From LSU
+    input  logic                     rf_wdata_tag_lsu_i,    // Load data tag from memory
+    input  logic                     rf_we_tag_lsu_i,       // LSU write enable tag
+
+    // To tag register file 
+    output logic                     rf_wdata_tag_wb_o,     //data tag to write back to register file
+    output logic                     rf_we_tag_wb_o,        //write enable tag to write back to register file
+
+    // Forwarding to ID Stage
+    output logic                     rf_wdata_fwd_tag_wb_o  //forwarded tag to ID stage 
+ `endif
 );
 
   import ibex_pkg::*;
@@ -83,11 +102,17 @@ module ibex_wb_stage #(
 
     logic           wb_valid_d;
 
+    //DIFT local signals
+    `ifdef DIFT
+        logic rf_wdata_tag_wb_q;
+        logic rf_we_tag_wb_q;
+    `endif
+
     // Stage becomes valid if an instruction enters for ID/EX and valid is cleared when instruction
     // is done
     assign wb_valid_d = (en_wb_i & ready_wb_o) | (wb_valid_q & ~wb_done);
 
-    // Writeback for non load/store instructions always completes in a cycle (so instantly done)
+    // Writeback for non load/store instructions always completes in a cycle =instantaneous wb
     // Writeback for load/store must wait for response to be received by the LSU
     // Signal only relevant if wb_valid_q set
     assign wb_done = (wb_instr_type_q == WB_INSTR_OTHER) | lsu_resp_valid_i;
@@ -110,6 +135,11 @@ module ibex_wb_stage #(
           wb_pc_q         <= '0;
           wb_compressed_q <= '0;
           wb_count_q      <= '0;
+          `ifdef DIFT
+            rf_we_tag_wb_q    <= 1'b0;  //reset tag write enable
+            rf_wdata_tag_wb_q <= 1'b0;  //reset tag data
+          `endif
+
         end else if (en_wb_i) begin
           rf_we_wb_q      <= rf_we_id_i;
           rf_waddr_wb_q   <= rf_waddr_id_i;
@@ -118,6 +148,10 @@ module ibex_wb_stage #(
           wb_pc_q         <= pc_id_i;
           wb_compressed_q <= instr_is_compressed_id_i;
           wb_count_q      <= instr_perf_count_id_i;
+          `ifdef DIFT
+            rf_we_tag_wb_q    <= rf_we_tag_id_i;      //tag for write enable to register file
+            rf_wdata_tag_wb_q <= rf_wdata_tag_id_i;   //tag for data to register file coming from ID stage
+          `endif
         end
       end
     end else begin : g_wb_regs_nr
@@ -130,6 +164,10 @@ module ibex_wb_stage #(
           wb_pc_q         <= pc_id_i;
           wb_compressed_q <= instr_is_compressed_id_i;
           wb_count_q      <= instr_perf_count_id_i;
+          `ifdef DIFT
+            rf_we_tag_wb_q    <= rf_we_tag_id_i;       //tag for write enable to register file
+            rf_wdata_tag_wb_q <= rf_wdata_tag_id_i;    //tag for data to register file coming from ID stage
+          `endif
         end
       end
     end
@@ -167,6 +205,13 @@ module ibex_wb_stage #(
     assign rf_wdata_fwd_wb_o = rf_wdata_wb_q;
 
     assign rf_wdata_wb_mux_we[1] = rf_we_lsu_i;
+
+    //DIFT Tag assigns 
+    `ifdef DIFT
+      assign rf_wdata_fwd_tag_wb_o = rf_wdata_tag_wb_q;
+      assign rf_wdata_tag_wb_o     = rf_wdata_tag_wb_q & wb_valid_q;
+      assign rf_we_tag_wb_o        = rf_we_tag_wb_q    & wb_valid_q;
+    `endif
 
     if (DummyInstructions) begin : g_dummy_instr_wb
       logic dummy_instr_wb_q;
@@ -236,6 +281,13 @@ module ibex_wb_stage #(
     assign rf_write_wb_o          = 1'b0;
     assign rf_wdata_fwd_wb_o      = 32'b0;
     assign instr_done_wb_o        = 1'b0;
+
+    // DIFT tag assigns via LSU
+    `ifdef DIFT
+      assign rf_wdata_fwd_tag_wb_o = rf_we_tag_lsu_i ? rf_wdata_tag_lsu_i : rf_wdata_tag_id_i;
+      assign rf_wdata_tag_wb_o     = rf_we_tag_lsu_i ? rf_wdata_tag_lsu_i : rf_wdata_tag_id_i;
+      assign rf_we_tag_wb_o        = rf_we_tag_lsu_i | rf_we_tag_id_i;
+    `endif
   end
 
   assign rf_wdata_wb_mux[1] = rf_wdata_lsu_i;

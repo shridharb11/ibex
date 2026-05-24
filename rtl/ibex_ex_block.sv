@@ -51,6 +51,32 @@ module ibex_ex_block #(
   output logic                  branch_decision_o,     // to ID
 
   output logic                  ex_valid_o             // EX has valid output
+
+  //DIFT signals
+  `ifdef DIFT
+    ,
+     // Inputs from ID Stage
+    input  logic  alu_op_a_tag_i,       // ALU operand A tag
+    input  logic  alu_op_b_tag_i,       // ALU operand B tag
+    input  logic  rf_we_tag_i,          // Tag for write enable
+    input  logic  lsu_wdata_tag_i,      // Tag for data being written to memory
+
+    //new additions
+    input  logic [ibex_pkg::ALU_MODE_WIDTH-1:0] alu_tag_mode_i,   // TPR mode from riscv_mode_tag
+    input  logic                      check_s1_i,        // TCR source-1 check
+    input  logic                      check_s2_i,        // TCR source-2 check
+    input  logic                      check_d_i,         // TCR dest check
+    input  logic                      is_load_i,         // suppress check for loads
+    output logic                      ex_tag_err_o,        // ALU-level taint violation
+    input  logic                      instr_tag_i,      // Tag of the instruction itself 
+
+    // Outputs to WB/LSU/ID
+    output logic  rf_wdata_ex_tag_o,    // Feedback to ID Forwarding
+    output logic  regfile_wdata_tag_o,  // To Writeback Stage
+    output logic  rf_we_tag_o,          // To Writeback Stage
+    output logic  lsu_wdata_tag_o       // To LSU
+    
+  `endif
 );
 
   import ibex_pkg::*;
@@ -190,6 +216,33 @@ module ibex_ex_block #(
       .multdiv_result_o  (multdiv_result)
     );
   end
+  
+//DIFT logic in EX stage
+`ifdef DIFT
+  logic ex_result_tag;
+  logic unused_rf_en, unused_pc_en;
+
+  ibex_dift_logic u_dift_logic (
+    .operator_i      (alu_tag_mode_i),
+    .operand_a_tag_i (alu_op_a_tag_i),
+    .operand_b_tag_i (alu_op_b_tag_i),
+    .instr_tag_i     (instr_tag_i),
+    .check_s1_i      (check_s1_i),
+    .check_s2_i      (check_s2_i),
+    .check_d_i       (check_d_i),
+    .is_load_i       (is_load_i),
+    .result_tag_o    (ex_result_tag),
+    .rf_enable_tag_o (unused_rf_en),
+    .pc_enable_tag_o (unused_pc_en),
+    .exception_o     (ex_tag_err_o)
+  );
+
+  assign rf_wdata_ex_tag_o   = ex_result_tag;
+  assign regfile_wdata_tag_o = ex_result_tag;
+  assign rf_we_tag_o         = rf_we_tag_i;
+  assign lsu_wdata_tag_o     = lsu_wdata_tag_i;
+`endif
+
 
   // Multiplier/divider may require multiple cycles. The ALU output is valid in the same cycle
   // unless the intermediate result register is being written (which indicates this isn't the

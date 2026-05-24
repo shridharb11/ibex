@@ -9,28 +9,27 @@
  * Instruction fetch unit: Selection of the next PC, and buffering (sampling) of
  * the read instruction.
  */
-
+`define DIFT 
 `include "prim_assert.sv"
 `include "dv_fcov_macros.svh"
 
 module ibex_if_stage import ibex_pkg::*; #(
-  parameter int unsigned DmHaltAddr           = 32'h1A110800,
-  parameter int unsigned DmExceptionAddr      = 32'h1A110808,
-  parameter bit          DummyInstructions    = 1'b0,
-  parameter bit          ICache               = 1'b0,
-  parameter rv32zc_e     RV32ZC               = RV32ZcaZcbZcmp,
-  parameter bit          ICacheECC            = 1'b0,
-  parameter bit          ICacheTweakInfection = 1'b0,
-  parameter int unsigned BusSizeECC           = BUS_SIZE,
-  parameter int unsigned TagSizeECC           = IC_TAG_SIZE,
-  parameter int unsigned LineSizeECC          = IC_LINE_SIZE,
-  parameter bit          PCIncrCheck          = 1'b0,
-  parameter bit          ResetAll             = 1'b0,
-  parameter lfsr_seed_t  RndCnstLfsrSeed      = RndCnstLfsrSeedDefault,
-  parameter lfsr_perm_t  RndCnstLfsrPerm      = RndCnstLfsrPermDefault,
-  parameter bit          BranchPredictor      = 1'b0,
-  parameter bit          MemECC               = 1'b0,
-  parameter int unsigned MemDataWidth         = MemECC ? 32 + 7 : 32
+  parameter int unsigned DmHaltAddr        = 32'h1A110800,
+  parameter int unsigned DmExceptionAddr   = 32'h1A110808,
+  parameter bit          DummyInstructions = 1'b0,
+  parameter bit          ICache            = 1'b0,
+  parameter rv32zc_e     RV32ZC            = RV32ZcaZcbZcmp,
+  parameter bit          ICacheECC         = 1'b0,
+  parameter int unsigned BusSizeECC        = BUS_SIZE,
+  parameter int unsigned TagSizeECC        = IC_TAG_SIZE,
+  parameter int unsigned LineSizeECC       = IC_LINE_SIZE,
+  parameter bit          PCIncrCheck       = 1'b0,
+  parameter bit          ResetAll          = 1'b0,
+  parameter lfsr_seed_t  RndCnstLfsrSeed   = RndCnstLfsrSeedDefault,
+  parameter lfsr_perm_t  RndCnstLfsrPerm   = RndCnstLfsrPermDefault,
+  parameter bit          BranchPredictor   = 1'b0,
+  parameter bit          MemECC            = 1'b0,
+  parameter int unsigned MemDataWidth      = MemECC ? 32 + 7 : 32
 ) (
   input  logic                         clk_i,
   input  logic                         rst_ni,
@@ -124,6 +123,13 @@ module ibex_if_stage import ibex_pkg::*; #(
   // misc signals
   output logic                        pc_mismatch_alert_o,
   output logic                        if_busy_o                 // IF stage is busy fetching instr
+
+  `ifdef DIFT
+    ,
+    input logic                       branch_target_ex_i_tag,   //tainting from EX stage for branch target
+    output logic                      pc_if_o_tag,              //current PC tag being fetched
+    output logic                      pc_id_o_tag               // tag of the PC currently in ID stage
+  `endif
 );
 
   logic              instr_valid_id_d, instr_valid_id_q;
@@ -227,6 +233,41 @@ module ibex_if_stage import ibex_pkg::*; #(
     endcase
   end
 
+  `ifdef DIFT
+    //tagfetch address selection mux for tag propagation in DIFT
+    logic fetch_addr_n_tag;
+
+    always_comb begin : fetch_addr_tag_mux
+        unique case (pc_mux_internal)
+        PC_BOOT: fetch_addr_n_tag = 1'b0;
+        PC_JUMP: fetch_addr_n_tag = branch_target_ex_i_tag;
+        PC_EXC:  fetch_addr_n_tag = 1'b0; // Hardware-triggered exceptions are untainted
+        PC_ERET: fetch_addr_n_tag = 1'b0; // Restoring state via ERET is usually untainted
+        PC_DRET: fetch_addr_n_tag = 1'b0;
+        PC_BP:   fetch_addr_n_tag = 1'b0; // Branch predictor targets are considered safe. Real tag update when branch resolved
+        default: fetch_addr_n_tag = 1'b0;
+        endcase
+    end
+
+    // IF Stage PC Tag Register
+
+    logic pc_if_o_tag_q;
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+        pc_if_o_tag_q <= 1'b0;
+        end 
+        else if (pc_set_i) begin
+        pc_if_o_tag_q <= fetch_addr_n_tag;
+        end
+    end
+
+    assign pc_if_o_tag = pc_if_o_tag_q;
+  `endif
+
+
+
+
   // tell CS register file to initialize mtvec on boot
   assign csr_mtvec_init_o = (pc_mux_i == PC_BOOT) & pc_set_i;
 
@@ -277,8 +318,7 @@ module ibex_if_stage import ibex_pkg::*; #(
       .ResetAll        (ResetAll),
       .BusSizeECC      (BusSizeECC),
       .TagSizeECC      (TagSizeECC),
-      .LineSizeECC     (LineSizeECC),
-      .TweakInfection  (ICacheTweakInfection)
+      .LineSizeECC     (LineSizeECC)
     ) icache_i (
         .clk_i               ( clk_i                      ),
         .rst_ni              ( rst_ni                     ),
@@ -525,7 +565,12 @@ module ibex_if_stage import ibex_pkg::*; #(
         instr_expanded_id_o      <= '0;
         illegal_c_insn_id_o      <= '0;
         pc_id_o                  <= '0;
-      end else if (if_id_pipe_reg_we) begin
+        //tag into IF-ID pipeline register
+        `ifdef DIFT
+          pc_id_o_tag            <= 1'b0;
+        `endif 
+      end
+      else if (if_id_pipe_reg_we) begin
         instr_rdata_id_o         <= instr_out;
         // To reduce fan-out and help timing from the instr_rdata_id flops they are replicated.
         instr_rdata_alu_id_o     <= instr_out;
@@ -537,6 +582,10 @@ module ibex_if_stage import ibex_pkg::*; #(
         instr_expanded_id_o      <= if_instr_rdata[15:0];
         illegal_c_insn_id_o      <= illegal_c_instr_out;
         pc_id_o                  <= pc_if_o;
+        //tag into IF-ID pipeline register
+        `ifdef DIFT
+            pc_id_o_tag          <= pc_if_o_tag_q;
+        `endif 
       end
     end
   end else begin : g_instr_rdata_nr
@@ -553,6 +602,10 @@ module ibex_if_stage import ibex_pkg::*; #(
         instr_expanded_id_o      <= if_instr_rdata[15:0];
         illegal_c_insn_id_o      <= illegal_c_instr_out;
         pc_id_o                  <= pc_if_o;
+        //tag into IF-ID pipeline register
+        `ifdef DIFT
+            pc_id_o_tag          <= pc_if_o_tag_q;
+        `endif 
       end
     end
   end

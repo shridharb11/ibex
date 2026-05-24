@@ -57,6 +57,12 @@ module ibex_cs_registers import ibex_pkg::*; #(
   input                        csr_op_en_i,
   output logic [31:0]          csr_rdata_o,
 
+  //DIFT CSRs
+  `ifdef DIFT
+    output logic [31:0]        tpr_o,                   //tag propagation register    
+    output logic [31:0]        tcr_o,                   //tag control register
+  `endif 
+
   // interrupts
   input  logic                 irq_software_i,
   input  logic                 irq_timer_i,
@@ -245,6 +251,14 @@ module ibex_cs_registers import ibex_pkg::*; #(
   logic        mstack_en;
   logic [31:0] mstack_epc_q, mstack_epc_d;
   exc_cause_t  mstack_cause_q, mstack_cause_d;
+
+  //TPR and TCR for DIFT. local registers
+  `ifdef DIFT
+    logic [31:0] tpr_q;
+    logic        tpr_en;  //enable tpr
+    logic [31:0] tcr_q;
+    logic        tcr_en;  //enable tcr
+  `endif
 
   // PMP Signals
   logic [31:0]                 pmp_addr_rdata  [PMP_MAX_REGIONS];
@@ -546,6 +560,18 @@ module ibex_cs_registers import ibex_pkg::*; #(
         csr_rdata_int = '0;
       end
 
+      //TPR and TCR for DIFT
+    `ifdef DIFT
+      CSR_TPR: begin
+         csr_rdata_int = tpr_q;
+         illegal_csr   = 1'b0; // TPR is always implemented when DIFT is enabled
+      end
+      CSR_TCR: begin
+         csr_rdata_int = tcr_q;
+         illegal_csr   = 1'b0; // TCR is always implemented when DIFT is enabled
+      end
+    `endif
+
       default: begin
         illegal_csr = 1'b1;
       end
@@ -605,6 +631,11 @@ module ibex_cs_registers import ibex_pkg::*; #(
     cpuctrlsts_part_d  = cpuctrlsts_part_q;
 
     double_fault_seen_o = 1'b0;
+
+    `ifdef DIFT
+      tpr_en = 1'b0;
+      tcr_en = 1'b0;
+    `endif
 
     if (csr_we_int) begin
       unique case (csr_addr_i)
@@ -707,10 +738,19 @@ module ibex_cs_registers import ibex_pkg::*; #(
           cpuctrlsts_part_d  = cpuctrlsts_part_wdata;
           cpuctrlsts_part_we = 1'b1;
         end
+       `ifdef DIFT 
+        CSR_TPR: begin
+            tpr_en = 1'b1;
+        end
 
+        CSR_TCR: begin
+            tcr_en = 1'b1;
+        end
+        `endif
         default:;
       endcase
     end
+
 
     // exception controller gets priority over other writes
     unique case (1'b1)
@@ -1072,6 +1112,43 @@ module ibex_cs_registers import ibex_pkg::*; #(
     .rd_data_o (mstack_cause_q),
     .rd_error_o()
   );
+
+  //TPR and TCR instantiations from ibex_csr.sv module
+`ifdef DIFT
+    ibex_csr #(
+        .Width     (32),
+        .ShadowCopy(ShadowCSR),
+        .ResetValue(32'h0)
+    ) u_tpr_csr (
+        .clk_i(clk_i), 
+        .rst_ni(rst_ni), 
+        .wr_data_i(csr_wdata_int), 
+        .wr_en_i(tpr_en), 
+        .rd_data_o(tpr_q), 
+        .rd_error_o()
+    );
+
+    ibex_csr #(
+        .Width     (32),
+        .ShadowCopy(ShadowCSR),
+        .ResetValue(32'h0)
+    ) u_tcr_csr (
+        .clk_i(clk_i), 
+        .rst_ni(rst_ni), 
+        .wr_data_i(csr_wdata_int), 
+        .wr_en_i(tcr_en), 
+        .rd_data_o(tcr_q), 
+        .rd_error_o()
+    );
+
+`endif
+
+//outputs for DIFT
+`ifdef DIFT
+    assign tpr_o = tpr_q;
+    assign tcr_o = tcr_q;
+`endif
+
 
   // -----------------
   // PMP registers
