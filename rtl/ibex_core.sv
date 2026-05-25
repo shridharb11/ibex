@@ -1131,7 +1131,7 @@ module ibex_core import ibex_pkg::*; #(
   // identical read/write addresses to the integer RF.  Instantiated internally. No ECC
   // ===========================================================================
 `ifdef DIFT
-  ibex_register_file_fpga_tag #(
+  ibex_register_file_latch_tag #(
     .RV32E            (RV32E),
     .DataWidth        (1),          // 1-bit tag per register
     .DummyInstructions(DummyInstructions),
